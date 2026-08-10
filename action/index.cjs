@@ -147027,15 +147027,176 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.robot = void 0;
+exports.robot = exports.getChangedFiles = exports.createReviewBody = exports.createInlineReviewComment = exports.isHunkHeaderInPatch = exports.getReviewCommentLocation = void 0;
 const minimatch_1 = __nccwpck_require__(4501);
 const chat_js_1 = __nccwpck_require__(85365);
 const loglevel_1 = __importDefault(__nccwpck_require__(78063));
 const OPENAI_API_KEY = 'OPENAI_API_KEY';
+const COMPARE_FILES_LIMIT = 300;
+const REVIEW_MARKER = '<!-- chatgpt-code-review -->';
 const MAX_PATCH_COUNT = process.env.MAX_PATCH_LENGTH
     ? +process.env.MAX_PATCH_LENGTH
     : Infinity;
+const parseHunkHeader = (hunkHeader) => {
+    if (!hunkHeader) {
+        return null;
+    }
+    const match = hunkHeader.trim().match(/^@@\s+-\s*(\d+)(?:,(\d+))?\s+\+\s*(\d+)(?:,(\d+))?\s+@@/);
+    if (!match) {
+        return null;
+    }
+    const [, oldStartValue, oldCountValue, newStartValue, newCountValue] = match;
+    const oldStart = Number(oldStartValue);
+    const oldCount = oldCountValue === undefined ? 1 : Number(oldCountValue);
+    const newStart = Number(newStartValue);
+    const newCount = newCountValue === undefined ? 1 : Number(newCountValue);
+    return { oldStart, oldCount, newStart, newCount };
+};
+const getReviewCommentLocation = (hunkHeader) => {
+    const range = parseHunkHeader(hunkHeader);
+    if (!range) {
+        return null;
+    }
+    const { oldStart, oldCount, newStart, newCount } = range;
+    if (newCount > 0) {
+        return {
+            line: newStart + newCount - 1,
+            side: 'RIGHT',
+        };
+    }
+    if (oldCount > 0) {
+        return {
+            line: oldStart + oldCount - 1,
+            side: 'LEFT',
+        };
+    }
+    return null;
+};
+exports.getReviewCommentLocation = getReviewCommentLocation;
+const isHunkHeaderInPatch = (hunkHeader, patch) => {
+    const expectedRange = parseHunkHeader(hunkHeader);
+    if (!expectedRange) {
+        return false;
+    }
+    return patch.split('\n').some((line) => {
+        if (!line.startsWith('@@')) {
+            return false;
+        }
+        const actualRange = parseHunkHeader(line);
+        return (actualRange?.oldStart === expectedRange.oldStart &&
+            actualRange.oldCount === expectedRange.oldCount &&
+            actualRange.newStart === expectedRange.newStart &&
+            actualRange.newCount === expectedRange.newCount);
+    });
+};
+exports.isHunkHeaderInPatch = isHunkHeaderInPatch;
+const createInlineReviewComment = (path, body, hunkHeader, patch) => {
+    const location = (0, exports.getReviewCommentLocation)(hunkHeader);
+    if (!location || !(0, exports.isHunkHeaderInPatch)(hunkHeader, patch)) {
+        return null;
+    }
+    return {
+        path,
+        body,
+        line: location.line,
+        side: location.side,
+    };
+};
+exports.createInlineReviewComment = createInlineReviewComment;
+const createReviewBody = (hasInlineComments, bodyComments) => {
+    const heading = hasInlineComments || bodyComments.length
+        ? 'Code review by ChatGPT'
+        : 'LGTM 👍';
+    return [heading, ...bodyComments, REVIEW_MARKER].join('\n\n');
+};
+exports.createReviewBody = createReviewBody;
+const getChangedFiles = async (context) => {
+    const repo = context.repo();
+    const pullRequestFiles = await context.octokit.paginate(context.octokit.pulls.listFiles, {
+        owner: repo.owner,
+        repo: repo.repo,
+        pull_number: context.pullRequest().pull_number,
+        per_page: 100,
+    });
+    if (context.payload.action !== 'synchronize') {
+        return pullRequestFiles;
+    }
+    let comparisonBase;
+    try {
+        const reviews = await context.octokit.paginate(context.octokit.pulls.listReviews, {
+            owner: repo.owner,
+            repo: repo.repo,
+            pull_number: context.pullRequest().pull_number,
+            per_page: 100,
+        });
+        const botReview = reviews
+            .slice()
+            .reverse()
+            .find((r) => r.user?.type === 'Bot' &&
+            r.body?.includes(REVIEW_MARKER));
+        if (botReview) {
+            if (!botReview.commit_id) {
+                return pullRequestFiles;
+            }
+            comparisonBase = botReview.commit_id;
+        }
+        else {
+            const hasLegacyReview = reviews.some((r) => r.user?.type === 'Bot' &&
+                r.body &&
+                (r.body.startsWith('Code review by ChatGPT') ||
+                    r.body.startsWith('LGTM')));
+            if (hasLegacyReview) {
+                return pullRequestFiles;
+            }
+        }
+    }
+    catch (err) {
+        loglevel_1.default.debug('failed to detect previous bot review', err);
+        return pullRequestFiles;
+    }
+    if (!comparisonBase) {
+        comparisonBase = context.payload.before;
+    }
+    if (!comparisonBase) {
+        return pullRequestFiles;
+    }
+    try {
+        const { data } = await context.octokit.repos.compareCommits({
+            owner: repo.owner,
+            repo: repo.repo,
+            base: comparisonBase,
+            head: context.payload.pull_request.head.sha,
+        });
+        if (data.status === 'identical') {
+            return [];
+        }
+        if (data.status === 'ahead') {
+            if (!data.files) {
+                loglevel_1.default.debug('commit comparison omitted files; using the full pull request diff');
+                return pullRequestFiles;
+            }
+            const comparisonFiles = data.files;
+            if (comparisonFiles.length >= COMPARE_FILES_LIMIT) {
+                loglevel_1.default.debug('commit comparison reached the GitHub file limit; using the full pull request diff');
+                return pullRequestFiles;
+            }
+            const changedFilenames = new Set(comparisonFiles.map((file) => file.filename));
+            return pullRequestFiles.filter((file) => changedFilenames.has(file.filename));
+        }
+        loglevel_1.default.debug(`commit comparison from ${comparisonBase} is ${data.status}; using the full pull request diff`);
+    }
+    catch (err) {
+        loglevel_1.default.debug(`failed to compare commits from ${comparisonBase}`, err);
+    }
+    return pullRequestFiles;
+};
+exports.getChangedFiles = getChangedFiles;
 const robot = (app) => {
+    if (process.env.GITHUB_ACTIONS === 'true') {
+        app.onError(() => {
+            process.exitCode = 1;
+        });
+    }
     const loadChat = async (context) => {
         if (process.env.USE_GITHUB_MODELS === 'true' && process.env.GITHUB_TOKEN) {
             return new chat_js_1.Chat(process.env.GITHUB_TOKEN);
@@ -147086,61 +147247,7 @@ const robot = (app) => {
             loglevel_1.default.info('no target label attached');
             return 'no target label attached';
         }
-        const data = await context.octokit.repos.compareCommits({
-            owner: repo.owner,
-            repo: repo.repo,
-            base: context.payload.pull_request.base.sha,
-            head: context.payload.pull_request.head.sha,
-        });
-        let { files: changedFiles, commits } = data.data;
-        if (context.payload.action === 'synchronize') {
-            // Try to detect the last commit we reviewed (by looking for our previous review)
-            try {
-                const reviewsResp = await context.octokit.pulls.listReviews({
-                    owner: repo.owner,
-                    repo: repo.repo,
-                    pull_number: context.pullRequest().pull_number,
-                });
-                const reviews = reviewsResp.data || [];
-                // Find the most recent review created by this bot (we mark our reviews with a body)
-                const botReview = reviews
-                    .slice()
-                    .reverse()
-                    .find((r) => r.body && (r.body.startsWith('Code review by ChatGPT') || r.body.startsWith('LGTM')));
-                if (botReview?.commit_id) {
-                    const { data: { files, commits: newCommits }, } = await context.octokit.repos.compareCommits({
-                        owner: repo.owner,
-                        repo: repo.repo,
-                        base: botReview.commit_id,
-                        head: context.payload.pull_request.head.sha,
-                    });
-                    changedFiles = files;
-                    commits = newCommits;
-                }
-                else if (commits.length >= 2) {
-                    // fallback: compare last two commits in the PR
-                    const { data: { files }, } = await context.octokit.repos.compareCommits({
-                        owner: repo.owner,
-                        repo: repo.repo,
-                        base: commits[commits.length - 2].sha,
-                        head: commits[commits.length - 1].sha,
-                    });
-                    changedFiles = files;
-                }
-            }
-            catch (err) {
-                loglevel_1.default.debug('failed to detect previous bot review, falling back', err);
-                if (commits.length >= 2) {
-                    const { data: { files }, } = await context.octokit.repos.compareCommits({
-                        owner: repo.owner,
-                        repo: repo.repo,
-                        base: commits[commits.length - 2].sha,
-                        head: commits[commits.length - 1].sha,
-                    });
-                    changedFiles = files;
-                }
-            }
-        }
+        let changedFiles = await (0, exports.getChangedFiles)(context);
         loglevel_1.default.debug('changedFiles:', changedFiles);
         loglevel_1.default.debug;
         const ignoreList = (process.env.IGNORE || process.env.ignore || '')
@@ -147173,6 +147280,7 @@ const robot = (app) => {
         }
         console.time('gpt cost');
         const ress = [];
+        const bodyComments = [];
         for (let i = 0; i < changedFiles.length; i++) {
             const file = changedFiles[i];
             const patch = file.patch || '';
@@ -147189,26 +147297,14 @@ const robot = (app) => {
                 const reviews = Array.isArray(res) ? res : [res];
                 for (const review of reviews) {
                     if (!review.lgtm && !!review.review_comment) {
-                        let line;
-                        let side = 'RIGHT';
-                        // Extract line number from hunk header if available
-                        if (review.hunk_header) {
-                            const c = review.hunk_header.match(/\+\s*(\d+),(\d+)/);
-                            if (c) {
-                                const [, start, count] = c;
-                                line = Number(start) + Number(count) - 1;
-                            }
-                            else {
-                                loglevel_1.default.error(`Failed to parse hunk header: ${review.hunk_header}`);
-                                continue;
-                            }
+                        const inlineComment = (0, exports.createInlineReviewComment)(file.filename, review.review_comment, review.hunk_header, patch);
+                        if (!inlineComment) {
+                            const filename = file.filename.replace(/`/g, '\\`');
+                            bodyComments.push(`**File:** \`${filename}\`\n\n${review.review_comment}`);
+                            loglevel_1.default.error(`Failed to locate inline review comment: ${review.hunk_header || 'missing hunk header'}`);
+                            continue;
                         }
-                        ress.push({
-                            path: file.filename,
-                            body: review.review_comment,
-                            line: line,
-                            side: side,
-                        });
+                        ress.push(inlineComment);
                     }
                 }
             }
@@ -147222,7 +147318,7 @@ const robot = (app) => {
                 repo: repo.repo,
                 owner: repo.owner,
                 pull_number: context.pullRequest().pull_number,
-                body: ress.length ? "Code review by ChatGPT" : "LGTM 👍",
+                body: (0, exports.createReviewBody)(ress.length > 0, bodyComments),
                 event: 'COMMENT',
                 commit_id: context.payload.pull_request.head.sha,
                 comments: ress,
